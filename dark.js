@@ -16,7 +16,16 @@
 // "signatures" in browser.storage.local. On the next load those signatures
 // are turned into plain CSS selectors and baked into the injected style
 // element up front — so previously-seen bars render dark from first paint,
-// before the live scan even runs.
+// before the live scan even runs. Because framework-appended classes (e.g.
+// Angular's `ng-star-inserted`) land on the element AFTER it is first
+// painted, each signature also contributes a "prefix" selector (tag + its
+// first two classes, since class-attribute order is insertion order) so the
+// bar matches during that transitional state too, not just once fully
+// settled.
+//
+// A synchronous localStorage mirror of the enabled flag + cached bar CSS
+// lets the very first paint be styled correctly even before the async
+// browser.storage.local round trip resolves.
 
 (function () {
   "use strict";
@@ -24,6 +33,8 @@
   var STYLE_ID = "mimecast-dark-style";
   var BAR_ATTR = "data-mcd-bar";
   var BAR_CACHE_LIMIT = 20;
+  var MIRROR_ENABLED_KEY = "__mcd_enabled";
+  var MIRROR_BARCSS_KEY = "__mcd_barcss";
 
   var BASE_CSS =
     "html { filter: invert(0.92) hue-rotate(180deg) !important; background: #fff !important; }\n" +
@@ -36,6 +47,25 @@
   function isEnabled(value) {
     // Unset (undefined) defaults to enabled.
     return value === undefined || value === true;
+  }
+
+  // ---- localStorage mirror (sync, pre-paint) -----------------------------
+
+  function readMirror(key) {
+    try {
+      return window.localStorage.getItem(key);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function writeMirror(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch (e) {
+      // localStorage can throw (sandboxed frame, storage disabled, etc).
+      // The mirror is a best-effort optimization — silently skip.
+    }
   }
 
   // ---- selector cache (flicker-proof revisits) ---------------------------
@@ -65,7 +95,7 @@
     return tag + "|" + classes.join(" ");
   }
 
-  function signatureToSelector(sig) {
+  function parseSignature(sig) {
     var pipeIndex = sig.indexOf("|");
     if (pipeIndex === -1) {
       return null;
@@ -73,9 +103,17 @@
     var tag = sig.slice(0, pipeIndex);
     var classesStr = sig.slice(pipeIndex + 1);
     var classes = classesStr.length ? classesStr.split(" ") : [];
+    return { tag: tag, classes: classes };
+  }
+
+  function buildSelector(tag, classes, limitCount) {
+    var use = classes;
+    if (typeof limitCount === "number" && classes.length > limitCount) {
+      use = classes.slice(0, limitCount);
+    }
     var selector = tag;
-    for (var i = 0; i < classes.length; i++) {
-      selector += "." + CSS.escape(classes[i]);
+    for (var i = 0; i < use.length; i++) {
+      selector += "." + CSS.escape(use[i]);
     }
     return selector;
   }
@@ -84,17 +122,37 @@
     if (!cachedSignatures.length) {
       return "";
     }
-    var rules = [];
-    for (var i = 0; i < cachedSignatures.length; i++) {
-      var selector = signatureToSelector(cachedSignatures[i]);
-      if (!selector) {
-        continue;
+    var seen = {};
+    var selectors = [];
+    cachedSignatures.forEach(function (sig) {
+      var parsed = parseSignature(sig);
+      if (!parsed) {
+        return;
       }
-      rules.push(
+      var full = buildSelector(parsed.tag, parsed.classes);
+      if (!seen[full]) {
+        seen[full] = true;
+        selectors.push(full);
+      }
+      if (parsed.classes.length > 0) {
+        // Prefix selector: matches before the framework finishes appending
+        // its own classes (e.g. Angular Material's ng-star-inserted).
+        var prefix = buildSelector(parsed.tag, parsed.classes, 2);
+        if (!seen[prefix]) {
+          seen[prefix] = true;
+          selectors.push(prefix);
+        }
+      }
+    });
+    if (!selectors.length) {
+      return "";
+    }
+    var rules = selectors.map(function (selector) {
+      return (
         selector + " { background-color: #f2f2f4 !important; background-image: none !important; }\n" +
         selector + ", " + selector + " * { color: #17171a !important; }"
       );
-    }
+    });
     return rules.join("\n");
   }
 
@@ -118,6 +176,7 @@
     var update = {};
     update[barsKey] = cachedSignatures.slice();
     browser.storage.local.set(update);
+    writeMirror(MIRROR_BARCSS_KEY, buildCachedBarCss());
   }
 
   // ---- style element -------------------------------------------------
@@ -127,17 +186,18 @@
     return cached ? BASE_CSS + "\n" + BAR_CSS + "\n" + cached : BASE_CSS + "\n" + BAR_CSS;
   }
 
-  function injectStyle() {
-    if (document.getElementById(STYLE_ID)) {
-      return;
-    }
-    var style = document.createElement("style");
-    style.id = STYLE_ID;
-    style.textContent = buildStyleCss();
-    var root = document.documentElement;
-    if (root) {
+  function ensureStyleWithCss(cssText) {
+    var style = document.getElementById(STYLE_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = STYLE_ID;
+      var root = document.documentElement;
+      if (!root) {
+        return;
+      }
       root.appendChild(style);
     }
+    style.textContent = cssText;
   }
 
   function removeStyle() {
@@ -281,6 +341,9 @@
   var barObserver = null;
   var barRafId = null;
   var barWatcherActive = false;
+  var barSafetyTimers = [];
+  var barDomReadyHandler = null;
+  var barLoadHandler = null;
 
   function scheduleScan() {
     if (barRafId !== null) {
@@ -299,26 +362,35 @@
     }
     barWatcherActive = true;
 
-    function beginObserving() {
+    // No DOMContentLoaded gate: start scanning and observing immediately,
+    // even before <body> exists. scanForBars() itself tolerates a null body.
+    scanForBars();
+
+    barObserver = new MutationObserver(function () {
+      scheduleScan();
+    });
+    barObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class", "style"]
+    });
+
+    function safetyScan() {
       if (!barWatcherActive) {
-        // Disabled again before DOMContentLoaded fired.
         return;
       }
       scanForBars();
-      barObserver = new MutationObserver(function () {
-        scheduleScan();
-      });
-      barObserver.observe(document.documentElement || document, {
-        childList: true,
-        subtree: true
-      });
     }
 
-    if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", beginObserving, { once: true });
-    } else {
-      beginObserving();
-    }
+    barDomReadyHandler = safetyScan;
+    barLoadHandler = safetyScan;
+    document.addEventListener("DOMContentLoaded", barDomReadyHandler, { once: true });
+    window.addEventListener("load", barLoadHandler, { once: true });
+
+    barSafetyTimers.push(setTimeout(safetyScan, 250));
+    barSafetyTimers.push(setTimeout(safetyScan, 1000));
+    barSafetyTimers.push(setTimeout(safetyScan, 3000));
   }
 
   function stopBarWatcher() {
@@ -331,6 +403,18 @@
       cancelAnimationFrame(barRafId);
       barRafId = null;
     }
+    barSafetyTimers.forEach(function (id) {
+      clearTimeout(id);
+    });
+    barSafetyTimers = [];
+    if (barDomReadyHandler) {
+      document.removeEventListener("DOMContentLoaded", barDomReadyHandler);
+      barDomReadyHandler = null;
+    }
+    if (barLoadHandler) {
+      window.removeEventListener("load", barLoadHandler);
+      barLoadHandler = null;
+    }
     clearBarMarks();
   }
 
@@ -338,14 +422,30 @@
 
   function applyState(enabled) {
     if (enabled) {
-      injectStyle();
+      ensureStyleWithCss(buildStyleCss());
       startBarWatcher();
     } else {
       stopBarWatcher();
       removeStyle();
     }
+    writeMirror(MIRROR_ENABLED_KEY, String(enabled));
   }
 
+  // 1. Synchronous optimistic pass: read the localStorage mirror BEFORE any
+  //    async work, and paint immediately if it doesn't say disabled. This
+  //    closes the first-paint gap that the async storage.local round trip
+  //    would otherwise leave open.
+  var mirrorEnabledStr = readMirror(MIRROR_ENABLED_KEY);
+  var mirrorBarCss = readMirror(MIRROR_BARCSS_KEY) || "";
+  var optimisticEnabled = mirrorEnabledStr !== "false";
+  if (optimisticEnabled) {
+    ensureStyleWithCss(BASE_CSS + "\n" + BAR_CSS + (mirrorBarCss ? "\n" + mirrorBarCss : ""));
+    startBarWatcher();
+  }
+
+  // 2. Canonical async reconcile: browser.storage.local remains the source
+  //    of truth. Once it resolves, correct the optimistic guess (including
+  //    rebuilding the style from the real cache) and refresh both mirrors.
   browser.storage.local.get([hostname, barsKey]).then(function (result) {
     cachedSignatures = Array.isArray(result[barsKey]) ? result[barsKey] : [];
     applyState(isEnabled(result[hostname]));
