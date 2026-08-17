@@ -26,15 +26,31 @@
 // A synchronous localStorage mirror of the enabled flag + cached bar CSS
 // lets the very first paint be styled correctly even before the async
 // browser.storage.local round trip resolves.
+//
+// Some pages render their top bar inside an open shadow root (a custom
+// element like <mc-navbar> wrapping <header class="mc-header">), which
+// neither document-level querySelectorAll nor a document-level stylesheet
+// can reach. The scan descends into every open shadow root it finds and
+// injects a duplicate of the bar-marking CSS directly into each one.
 
 (function () {
   "use strict";
 
+  // Debug telemetry instrumentation, off by default in every committed and
+  // normally-built copy of this file. apps/mimecast-dark/build_debug.py
+  // produces a separate dist/mimecast-dark-debug.xpi with this flag flipped
+  // to true (and the collector host permission added to its manifest) for
+  // live diagnosis; the checked-in source and normal build never send
+  // anything anywhere.
+  var MCD_DEBUG = false;
+
   var STYLE_ID = "mimecast-dark-style";
+  var SHADOW_STYLE_ID = "mimecast-dark-shadow-style";
   var BAR_ATTR = "data-mcd-bar";
   var BAR_CACHE_LIMIT = 20;
   var MIRROR_ENABLED_KEY = "__mcd_enabled";
   var MIRROR_BARCSS_KEY = "__mcd_barcss";
+  var lastKnownEnabled = null;
 
   var BASE_CSS =
     "html { filter: invert(0.92) hue-rotate(180deg) !important; background: #fff !important; }\n" +
@@ -177,6 +193,7 @@
     update[barsKey] = cachedSignatures.slice();
     browser.storage.local.set(update);
     writeMirror(MIRROR_BARCSS_KEY, buildCachedBarCss());
+    refreshShadowStyles();
   }
 
   // ---- style element -------------------------------------------------
@@ -300,6 +317,91 @@
     return hsl.s > 0.2 && hsl.l > 0.08 && hsl.l < 0.92;
   }
 
+  // ---- shadow DOM piercing --------------------------------------------
+  //
+  // Some Mimecast pages (e.g. the /apps/ launcher) render their top bar
+  // inside an open shadow root (a custom element like <mc-navbar> wrapping
+  // <header class="mc-header">). Neither document.querySelectorAll nor a
+  // stylesheet attached to the document can reach across that boundary, so
+  // both the scan and the injected CSS have to be duplicated per shadow
+  // root. getBoundingClientRect/getComputedStyle work the same regardless
+  // of which side of the boundary an element is on, so isColoredBar()
+  // itself needs no changes.
+
+  var shadowRoots = new Set();
+  var shadowObservers = new Map();
+
+  function buildShadowCss() {
+    var cached = buildCachedBarCss();
+    return cached ? BAR_CSS + "\n" + cached : BAR_CSS;
+  }
+
+  function ensureShadowStyle(root) {
+    var style = root.querySelector("#" + SHADOW_STYLE_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = SHADOW_STYLE_ID;
+      root.appendChild(style);
+    }
+    style.textContent = buildShadowCss();
+  }
+
+  function refreshShadowStyles() {
+    if (!shadowRoots.size) {
+      return;
+    }
+    var css = buildShadowCss();
+    shadowRoots.forEach(function (root) {
+      var style = root.querySelector("#" + SHADOW_STYLE_ID);
+      if (style) {
+        style.textContent = css;
+      }
+    });
+  }
+
+  function handleShadowRootDiscovered(root) {
+    if (shadowRoots.has(root)) {
+      return;
+    }
+    shadowRoots.add(root);
+    ensureShadowStyle(root);
+
+    var observer = new MutationObserver(function () {
+      scheduleScan();
+    });
+    observer.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class", "style"]
+    });
+    shadowObservers.set(root, observer);
+  }
+
+  // Recursively visits every element under `root` (a Document, Element, or
+  // ShadowRoot), descending into any open shadow root it finds. Discovers
+  // and wires up new shadow roots along the way.
+  function walkAll(root, visit) {
+    var all = root.querySelectorAll("*");
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      visit(el);
+      if (el.shadowRoot) {
+        handleShadowRootDiscovered(el.shadowRoot);
+        walkAll(el.shadowRoot, visit);
+      }
+    }
+  }
+
+  function unmarkStale(root, candidateSet) {
+    var marked = root.querySelectorAll("[" + BAR_ATTR + "]");
+    for (var i = 0; i < marked.length; i++) {
+      if (!candidateSet.has(marked[i])) {
+        marked[i].removeAttribute(BAR_ATTR);
+      }
+    }
+  }
+
   function scanForBars() {
     var root = document.body || document.documentElement;
     if (!root) {
@@ -307,21 +409,18 @@
     }
 
     var candidates = [];
-    var all = root.querySelectorAll("*");
-    for (var i = 0; i < all.length; i++) {
-      if (isColoredBar(all[i])) {
-        candidates.push(all[i]);
+    walkAll(root, function (el) {
+      if (isColoredBar(el)) {
+        candidates.push(el);
       }
-    }
+    });
 
     var candidateSet = new Set(candidates);
 
-    var marked = document.querySelectorAll("[" + BAR_ATTR + "]");
-    for (var j = 0; j < marked.length; j++) {
-      if (!candidateSet.has(marked[j])) {
-        marked[j].removeAttribute(BAR_ATTR);
-      }
-    }
+    unmarkStale(document, candidateSet);
+    shadowRoots.forEach(function (sr) {
+      unmarkStale(sr, candidateSet);
+    });
 
     candidates.forEach(function (el) {
       el.setAttribute(BAR_ATTR, "");
@@ -336,6 +435,12 @@
     for (var i = 0; i < marked.length; i++) {
       marked[i].removeAttribute(BAR_ATTR);
     }
+    shadowRoots.forEach(function (sr) {
+      var markedInShadow = sr.querySelectorAll("[" + BAR_ATTR + "]");
+      for (var j = 0; j < markedInShadow.length; j++) {
+        markedInShadow[j].removeAttribute(BAR_ATTR);
+      }
+    });
   }
 
   var barObserver = null;
@@ -415,12 +520,280 @@
       window.removeEventListener("load", barLoadHandler);
       barLoadHandler = null;
     }
+
+    shadowObservers.forEach(function (observer) {
+      observer.disconnect();
+    });
+    shadowObservers.clear();
+    shadowRoots.forEach(function (root) {
+      var style = root.querySelector("#" + SHADOW_STYLE_ID);
+      if (style && style.parentNode) {
+        style.parentNode.removeChild(style);
+      }
+    });
+
     clearBarMarks();
+    shadowRoots.clear();
+  }
+
+  // ---- debug telemetry (MCD_DEBUG only) ----------------------------------
+  //
+  // Diagnoses a specific failure mode: some launcher pages keep their brand
+  // top bar its original color while the rest of the page goes dark. Two
+  // hypotheses: (1) the bar or a wrapper has an inline background-image, so
+  // our own media counter-invert rule `[style*="background-image"]`
+  // re-inverts it back to original colors; (2) the bar lives inside shadow
+  // DOM, which neither our stylesheet selectors nor querySelectorAll can
+  // reach. This section gathers evidence for both without changing any
+  // production behavior — isColoredBar() itself is untouched; the rejection
+  // tracer below is a separate, diagnostic-only copy of its logic.
+
+  function truncateStr(str, maxLen) {
+    if (typeof str !== "string") {
+      return "";
+    }
+    return str.length > maxLen ? str.slice(0, maxLen) : str;
+  }
+
+  function rectOf(el) {
+    var r = el.getBoundingClientRect();
+    return { t: r.top, l: r.left, w: r.width, h: r.height };
+  }
+
+  // Mirrors isColoredBar()'s branches exactly, but returns a reason string
+  // on failure (or null on a would-match) instead of a boolean. Kept as an
+  // independent copy so debug instrumentation can never change production
+  // detection behavior.
+  function explainColoredBar(el) {
+    var rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) {
+      return "zero-rect";
+    }
+    if (rect.height < 24 || rect.height > 160) {
+      return "height-out-of-range";
+    }
+    if (rect.width < 0.6 * window.innerWidth) {
+      return "width-too-narrow";
+    }
+
+    var style = window.getComputedStyle(el);
+    var fixedOrSticky = style.position === "fixed" || style.position === "sticky";
+    if (!fixedOrSticky && rect.top > 120) {
+      return "top-too-far";
+    }
+    if (!fixedOrSticky && !el.offsetParent) {
+      return "not-visible";
+    }
+
+    var bgImage = style.backgroundImage || "";
+    if (bgImage.indexOf("gradient") !== -1) {
+      return null; // would match
+    }
+
+    var rgba = parseRgba(style.backgroundColor);
+    if (!rgba || rgba.a < 0.1) {
+      return "no-usable-background-color";
+    }
+
+    var hsl = rgbToHsl(rgba.r, rgba.g, rgba.b);
+    if (!(hsl.s > 0.2 && hsl.l > 0.08 && hsl.l < 0.92)) {
+      return "hsl-out-of-colored-range";
+    }
+    return null; // would match
+  }
+
+  // Debug-only candidate net: broader than the production bar heuristic on
+  // purpose (top<250, width>=0.4*innerWidth, no height/position/visibility
+  // filter) so the report shows everything in play near the top of the
+  // page, not just what the production heuristic already accepts.
+  function collectDebugCandidates(root) {
+    var out = [];
+    var all = root.querySelectorAll("*");
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      var rect = el.getBoundingClientRect();
+      if (rect.top < 250 && rect.width >= 0.4 * window.innerWidth) {
+        out.push(el);
+      }
+    }
+    return out;
+  }
+
+  function buildGeneratedSelectors() {
+    var full = [];
+    var prefix = [];
+    var seenFull = {};
+    var seenPrefix = {};
+    cachedSignatures.forEach(function (sig) {
+      var parsed = parseSignature(sig);
+      if (!parsed) {
+        return;
+      }
+      var f = buildSelector(parsed.tag, parsed.classes);
+      if (!seenFull[f]) {
+        seenFull[f] = true;
+        full.push(f);
+      }
+      if (parsed.classes.length > 0) {
+        var p = buildSelector(parsed.tag, parsed.classes, 2);
+        if (!seenPrefix[p]) {
+          seenPrefix[p] = true;
+          prefix.push(p);
+        }
+      }
+    });
+    return { full: full, prefix: prefix };
+  }
+
+  function buildElementRecord(el, idx, combinedSelectors) {
+    var style = window.getComputedStyle(el);
+    var matched = [];
+    combinedSelectors.forEach(function (selector) {
+      try {
+        if (el.matches(selector)) {
+          matched.push(selector);
+        }
+      } catch (e) {
+        // Malformed selector — skip.
+      }
+    });
+    return {
+      idx: idx,
+      tag: el.tagName.toLowerCase(),
+      id: el.id || null,
+      class: el.getAttribute("class"),
+      rect: rectOf(el),
+      position: style.position,
+      backgroundColor: style.backgroundColor,
+      backgroundImage: truncateStr(style.backgroundImage || "", 200),
+      styleAttr: truncateStr(el.getAttribute("style") || "", 300),
+      hasBarAttr: el.hasAttribute(BAR_ATTR),
+      matchedCachedSelectors: matched
+    };
+  }
+
+  function findAllShadowHosts(root) {
+    var hosts = [];
+    var all = root.querySelectorAll("*");
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].shadowRoot) {
+        hosts.push(all[i]);
+      }
+    }
+    return hosts;
+  }
+
+  function dumpShadowHost(hostEl, depth, combinedSelectors) {
+    var shadowRoot = hostEl.shadowRoot;
+    var elementsInShadow = collectDebugCandidates(shadowRoot);
+    var records = elementsInShadow.map(function (el, i) {
+      return buildElementRecord(el, i, combinedSelectors);
+    });
+
+    var nested = [];
+    if (depth < 2) {
+      var nestedHosts = findAllShadowHosts(shadowRoot).filter(function (h) {
+        return h.getBoundingClientRect().top < 250;
+      });
+      nested = nestedHosts.map(function (h) {
+        return dumpShadowHost(h, depth + 1, combinedSelectors);
+      });
+    }
+
+    return {
+      tag: hostEl.tagName.toLowerCase(),
+      class: hostEl.getAttribute("class"),
+      rect: rectOf(hostEl),
+      shadowElements: records,
+      nestedShadowHosts: nested
+    };
+  }
+
+  function buildShadowDomReport(combinedSelectors) {
+    var allHosts = findAllShadowHosts(document);
+    var topHosts = allHosts.filter(function (h) {
+      return h.getBoundingClientRect().top < 250;
+    });
+    return {
+      totalShadowHostCount: allHosts.length,
+      hostsInTopStrip: topHosts.map(function (h) {
+        return dumpShadowHost(h, 1, combinedSelectors);
+      })
+    };
+  }
+
+  function gatherDebugReport() {
+    var generatedSelectors = buildGeneratedSelectors();
+    var combinedSelectors = generatedSelectors.full.concat(generatedSelectors.prefix);
+
+    var topStripEls = collectDebugCandidates(document);
+    var topStripElements = topStripEls.map(function (el, i) {
+      return buildElementRecord(el, i, combinedSelectors);
+    });
+
+    var counterInvertMatches = { bgImageStyle: [], img: [], iframe: [] };
+    topStripEls.forEach(function (el, i) {
+      try {
+        if (el.matches('[style*="background-image"]')) {
+          counterInvertMatches.bgImageStyle.push(i);
+        }
+      } catch (e) {
+        // ignore
+      }
+      if (el.tagName === "IMG") {
+        counterInvertMatches.img.push(i);
+      }
+      if (el.tagName === "IFRAME") {
+        counterInvertMatches.iframe.push(i);
+      }
+    });
+
+    var rejections = [];
+    topStripEls.forEach(function (el, i) {
+      var reason = explainColoredBar(el);
+      if (reason) {
+        rejections.push({ idx: i, reason: reason });
+      }
+    });
+
+    return {
+      capturedAt: Date.now(),
+      href: location.href,
+      hostname: hostname,
+      enabled: lastKnownEnabled,
+      styleElementPresent: !!document.getElementById(STYLE_ID),
+      cachedSignatures: cachedSignatures.slice(),
+      generatedSelectors: generatedSelectors,
+      topStripElements: topStripElements,
+      counterInvertMatches: counterInvertMatches,
+      shadowDom: buildShadowDomReport(combinedSelectors),
+      rejections: rejections
+    };
+  }
+
+  function scheduleDebugCapture() {
+    if (!MCD_DEBUG) {
+      return;
+    }
+
+    function capture() {
+      try {
+        var report = gatherDebugReport();
+        browser.runtime.sendMessage({ type: "mcd-debug-report", payload: report }).catch(function () {});
+      } catch (e) {
+        // Diagnostics must never break the page.
+      }
+    }
+
+    window.addEventListener("load", capture, { once: true });
+    setTimeout(capture, 2000);
+    setTimeout(capture, 5000);
   }
 
   // ---- state wiring -----------------------------------------------------
 
   function applyState(enabled) {
+    lastKnownEnabled = enabled;
     if (enabled) {
       ensureStyleWithCss(buildStyleCss());
       startBarWatcher();
@@ -438,10 +811,13 @@
   var mirrorEnabledStr = readMirror(MIRROR_ENABLED_KEY);
   var mirrorBarCss = readMirror(MIRROR_BARCSS_KEY) || "";
   var optimisticEnabled = mirrorEnabledStr !== "false";
+  lastKnownEnabled = optimisticEnabled;
   if (optimisticEnabled) {
     ensureStyleWithCss(BASE_CSS + "\n" + BAR_CSS + (mirrorBarCss ? "\n" + mirrorBarCss : ""));
     startBarWatcher();
   }
+
+  scheduleDebugCapture();
 
   // 2. Canonical async reconcile: browser.storage.local remains the source
   //    of truth. Once it resolves, correct the optimistic guess (including

@@ -21,7 +21,7 @@ text becomes light, without touching Mimecast's own styling.
 
 ## Install
 
-Download `dist/mimecast-dark-1.0.3-signed.xpi` and open it with Firefox
+Download `dist/mimecast-dark-1.0.4-signed.xpi` and open it with Firefox
 (File > Open File, or drag it into a Firefox window). It is signed through
 Mozilla's AMO unlisted channel, so it installs permanently and survives
 browser restarts. It is not listed in the addons.mozilla.org store.
@@ -31,7 +31,7 @@ For development, the unsigned build can be loaded temporarily instead:
 1. Open `about:debugging#/runtime/this-firefox` in Firefox.
 2. Click "Load Temporary Add-on...".
 3. Select `manifest.json` from this repository, or download
-   `dist/mimecast-dark-1.0.3.xpi` and select that instead.
+   `dist/mimecast-dark-1.0.4.xpi` and select that instead.
 
 Temporary add-ons unload when Firefox closes.
 
@@ -59,7 +59,10 @@ live scan, which avoids a flash of the original colors on load. Some sites
 after it is first painted, so the cache also stores a shorter selector built
 from just the element's earliest classes, which keeps matching through that
 in-between state instead of losing the bar for a frame or two while the
-framework finishes styling it.
+framework finishes styling it. Some bars are rendered inside an open shadow
+DOM component rather than the regular page, which a normal stylesheet and
+element scan can't reach on their own — the extension also descends into
+those shadow roots to find and style bars living inside them.
 
 The toolbar icon toggles the dark styling on or off for the current
 hostname. The setting is stored in `browser.storage.local` and applies
@@ -73,8 +76,8 @@ immediately without a page reload.
 - `background.js` - background script: handles the toolbar click and keeps
   the toolbar badge in sync with the current tab.
 - `icon.svg` - toolbar icon.
-- `dist/mimecast-dark-1.0.3.xpi` - packaged build of the extension.
-- `dist/mimecast-dark-1.0.3-signed.xpi` - the same build, signed by Mozilla for
+- `dist/mimecast-dark-1.0.4.xpi` - packaged build of the extension.
+- `dist/mimecast-dark-1.0.4-signed.xpi` - the same build, signed by Mozilla for
   permanent install.
 
 ## License
