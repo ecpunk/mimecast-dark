@@ -1,0 +1,38 @@
+{
+  "manifest_version": 2,
+  "name": "Mimecast Dark",
+  "version": "1.0.2",
+  "description": "Forces dark mode on Mimecast admin console pages, with a per-site toggle.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "mimecast-dark@ecpunk.github.io"
+    }
+  },
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "icons": {
+    "48": "icon.svg",
+    "96": "icon.svg"
+  },
+  "browser_action": {
+    "default_title": "Mimecast Dark — toggle",
+    "default_icon": {
+      "48": "icon.svg",
+      "96": "icon.svg"
+    }
+  },
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": false
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.mimecast.com/*"],
+      "js": ["dark.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}
