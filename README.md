@@ -21,18 +21,19 @@ text becomes light, without touching Mimecast's own styling.
 
 ## Install
 
-This extension is not signed and published on addons.mozilla.org, so it has
-to be loaded manually:
+Download `dist/mimecast-dark-1.0.2-signed.xpi` and open it with Firefox
+(File > Open File, or drag it into a Firefox window). It is signed through
+Mozilla's AMO unlisted channel, so it installs permanently and survives
+browser restarts. It is not listed in the addons.mozilla.org store.
+
+For development, the unsigned build can be loaded temporarily instead:
 
 1. Open `about:debugging#/runtime/this-firefox` in Firefox.
 2. Click "Load Temporary Add-on...".
 3. Select `manifest.json` from this repository, or download
    `dist/mimecast-dark-1.0.2.xpi` and select that instead.
 
-Temporary add-ons unload when Firefox closes, so you will need to repeat
-these steps each time you restart the browser. A permanent install would
-require Mozilla's AMO signing process, which this project has not gone
-through.
+Temporary add-ons unload when Firefox closes.
 
 ## How it works
 
@@ -68,6 +69,8 @@ immediately without a page reload.
   the toolbar badge in sync with the current tab.
 - `icon.svg` - toolbar icon.
 - `dist/mimecast-dark-1.0.2.xpi` - packaged build of the extension.
+- `dist/mimecast-dark-1.0.2-signed.xpi` - the same build, signed by Mozilla for
+  permanent install.
 
 ## License
 
